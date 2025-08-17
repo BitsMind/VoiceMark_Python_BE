@@ -2,3 +2,10 @@
   omegaconf
   julius
   torch>=1.13.0
+  fastapi
+  uvicorn
+  torch
+  soundfile
+  requests
+  pydantic
+  audioseal
