@@ -1,16 +1,18 @@
+import base64
+import os
+import tempfile
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
+
+import requests
+import soundfile as sf
+import torch
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import torch
-import soundfile as sf
-import base64
-import requests
-from pathlib import Path
-from io import BytesIO
+
 from audioseal import AudioSeal
-import tempfile
-import os
-from typing import Optional
-import uvicorn
 
 # === FastAPI app ===
 app = FastAPI(title="Audio Watermarking API", version="1.0.0")

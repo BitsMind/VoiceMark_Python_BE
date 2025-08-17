@@ -9,3 +9,10 @@ isort
 flake8
 pre-commit
 huggingface_hub
+fastapi
+uvicorn
+torch
+soundfile
+requests
+pydantic
+audioseal
