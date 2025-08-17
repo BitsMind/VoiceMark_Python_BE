@@ -1,11 +1,11 @@
-  numpy
-  omegaconf
-  julius
-  torch>=1.13.0
-  fastapi
-  uvicorn
-  torch
-  soundfile
-  requests
-  pydantic
-  audioseal
+numpy
+omegaconf
+julius
+torch>=1.13.0
+torchaudio
+fastapi
+uvicorn[standard]
+soundfile
+requests
+pydantic
+audioseal
