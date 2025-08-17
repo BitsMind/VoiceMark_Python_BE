@@ -89,10 +89,12 @@ def preprocess_audio(data, sr):
 
 # === Routes ===
 @app.get("/")
+@app.head("/")
 async def root():
     return {"message": "Audio Watermarking API is running!", "status": "healthy"}
 
 @app.get("/health")
+@app.head("/health")
 async def health_check():
     return {
         "status": "healthy",
