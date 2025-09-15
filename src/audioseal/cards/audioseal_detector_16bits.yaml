@@ -2,7 +2,8 @@
 
 name: audioseal_detector_16bits
 model_type: seanet
-checkpoint: "https://huggingface.co/facebook/audioseal/resolve/main/detector_base.pth"
+# checkpoint: "https://huggingface.co/facebook/audioseal/resolve/main/detector_base.pth"
+checkpoint: "C:/Users/nguye/audioseal/src/audioseal/cards/checkpoint_detector_95.pth"
 nbits: 16
 seanet:
   activation: ELU

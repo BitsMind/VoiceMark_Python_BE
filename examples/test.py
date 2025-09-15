@@ -1,6 +1,7 @@
 import base64
 import os
 import tempfile
+import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -8,14 +9,29 @@ from typing import Optional
 import requests
 import soundfile as sf
 import torch
+import torchaudio
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from audioseal import AudioSeal
 
+# === Setup logging ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # === FastAPI app ===
-app = FastAPI(title="Audio Watermarking API", version="1.0.0")
+app = FastAPI(title="Audio Watermarking API", version="3.0.0")
+
+# === Add CORS middleware ===
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # === Models ===
 class WatermarkRequest(BaseModel):
@@ -37,25 +53,38 @@ device = None
 @app.on_event("startup")
 async def load_models():
     global watermark_model, detector_model, device
-    print("🔄 Loading AudioSeal models...")
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"📱 Using device: {device}")
+    logger.info("🔄 Loading AudioSeal models...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"📱 Using device: {device}")
+    
     try:
         watermark_model = AudioSeal.load_generator("audioseal_wm_16bits").to(device)
         detector_model = AudioSeal.load_detector("audioseal_detector_16bits").to(device)
-        print("✅ Models loaded successfully!")
+        
+        # Set to eval mode
+        watermark_model.eval()
+        detector_model.eval()
+        
+        logger.info("✅ Models loaded successfully!")
     except Exception as e:
-        print(f"❌ Error loading models: {e}")
+        logger.error(f"❌ Error loading models: {e}")
         raise e
 
 # === Helpers ===
 def load_audio_from_url(url):
     try:
-        response = requests.get(url, timeout=30)
+        # Simple download with reasonable timeout
+        response = requests.get(url, timeout=60)  # Increased from 30s
         response.raise_for_status()
-        return sf.read(BytesIO(response.content))
+        
+        # Use torchaudio for better format support
+        audio_data = BytesIO(response.content)
+        wav, sr = torchaudio.load(audio_data)
+        
+        return wav, sr
+        
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to load audio: {str(e)}")
 
 def audio_to_base64_string(file_path):
     try:
@@ -64,37 +93,37 @@ def audio_to_base64_string(file_path):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to convert audio to base64: {str(e)}")
 
-def preprocess_audio(data, sr):
+def preprocess_audio(wav, sr):
     try:
-        if data.ndim == 1:
-            data = data[None, None, :]
-        else:
-            data = data.T
-            data = data[None]
+        # Ensure proper shape for AudioSeal: [batch, channels, samples]
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0).unsqueeze(0)
+        elif wav.ndim == 2:
+            if wav.shape[0] > wav.shape[1]:  # If channels > samples, transpose
+                wav = wav.T
+            wav = wav.unsqueeze(0)  # Add batch dimension
 
-        wav = torch.tensor(data, dtype=torch.float32)
-
+        # Convert to mono if stereo
         if wav.shape[1] > 1:
             wav = wav.mean(dim=1, keepdim=True)
 
+        # Resample to 16kHz if needed
         if sr != 16000:
-            import torchaudio
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
             wav = resampler(wav)
             sr = 16000
 
         return wav.to(device), sr
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio preprocessing failed: {str(e)}")
 
 # === Routes ===
 @app.get("/")
-@app.head("/")
 async def root():
-    return {"message": "Audio Watermarking API is running!", "status": "healthy"}
+    return {"message": "Audio Watermarking API v3 is running!", "status": "healthy"}
 
 @app.get("/health")
-@app.head("/health")
 async def health_check():
     return {
         "status": "healthy",
@@ -110,109 +139,151 @@ async def add_watermark_from_url(request: WatermarkRequest):
     temp_file = None
 
     try:
-        print(f"🔄 Processing audio from URL: {request.audioUrl}")
-        print(f"💬 Watermark message: {request.watermarkMessage}")
+        logger.info(f"🔄 Processing audio from URL: {request.audioUrl[:100]}...")
+        logger.info(f"💬 Watermark message: {request.watermarkMessage}")
 
-        data, sr = load_audio_from_url(request.audioUrl)
-        wav, sr = preprocess_audio(data, sr)
+        # Load and preprocess audio
+        wav, sr = load_audio_from_url(request.audioUrl)
+        wav, sr = preprocess_audio(wav, sr)
+        logger.info(f"📊 Audio shape: {wav.shape}, Sample rate: {sr}")
 
-        # === Embed 16-bit binary string
-        binary_msg = request.watermarkMessage.strip()
-        if not all(bit in '01' for bit in binary_msg) or len(binary_msg) != 16:
-            raise HTTPException(status_code=400, detail="Watermark must be a 16-bit binary string (e.g., '0101010101010101')")
+        # Handle watermark message
+        if request.watermarkMessage and request.watermarkMessage.strip():
+            binary_msg = request.watermarkMessage.strip()
+            if not all(bit in '01' for bit in binary_msg) or len(binary_msg) != 16:
+                raise HTTPException(status_code=400, detail="Watermark must be a 16-bit binary string (e.g., '0101010101010101')")
+            
+            message_tensor = torch.tensor([[int(bit) for bit in binary_msg]], dtype=torch.int32).to(device)
+            logger.info(f"🔄 Using provided message: {binary_msg}")
+        else:
+            # Generate random message if none provided
+            message_tensor = torch.randint(0, 2, (1, 16), dtype=torch.int32).to(device)
+            binary_msg = ''.join(str(int(bit)) for bit in message_tensor.squeeze().cpu().numpy())
+            logger.info(f"🔄 Generated random message: {binary_msg}")
 
-        bit_tensor = torch.tensor([[int(bit) for bit in binary_msg]], dtype=torch.float32).to(device)
-        print("🔄 Generating watermark...")
-        watermark = watermark_model.get_watermark(wav, sr, bit_tensor)
-        watermarked_audio = wav + watermark
+        # Generate watermarked audio
+        logger.info("🔄 Generating watermarked audio...")
+        with torch.no_grad():
+            watermarked_audio = watermark_model(wav, sample_rate=sr, message=message_tensor, alpha=1.0)
 
-        # === Save watermarked file
+        # Save watermarked file
         temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        sf.write(temp_file.name, watermarked_audio.squeeze().detach().cpu().numpy(), sr)
-        print(f"✅ Watermarked audio saved to: {temp_file.name}")
+        audio_np = watermarked_audio.squeeze().detach().cpu().numpy()
+        sf.write(temp_file.name, audio_np, sr)
+        logger.info(f"✅ Watermarked audio saved to: {temp_file.name}")
 
-        # === Detect to verify
-        print("🔄 Verifying watermark...")
-        result, message_tensor = detector_model.detect_watermark(watermarked_audio, sr)
+        # Verify watermark
+        logger.info("🔄 Verifying watermark...")
+        with torch.no_grad():
+            results, detected_message = detector_model.detect_watermark(watermarked_audio, sample_rate=sr)
 
-        if result:
-            bit_list = message_tensor.flatten().tolist()
-            binary_string = ''.join(str(int(round(bit))) for bit in bit_list[:16])
+        # Check detection results
+        if hasattr(results, 'mean'):
+            confidence = results.mean().item()
+            is_detected = torch.all(results > 0.5).item()
+        else:
+            confidence = float(results)
+            is_detected = results > 0.5
 
-            print(f"✅ Watermark detected: {binary_string}")
+        if is_detected:
+            detected_bits = detected_message.squeeze().detach().cpu().numpy()
+            detected_binary = ''.join(str(int(round(bit))) for bit in detected_bits[:16])
+
+            logger.info(f"✅ Watermark detected: {detected_binary} (confidence: {confidence:.4f})")
             base64_audio = audio_to_base64_string(temp_file.name)
 
             return WatermarkResponse(
                 status="success",
                 base64_audio=base64_audio,
-                decoded_message=binary_string
+                decoded_message=detected_binary
             )
         else:
-            print("❌ Watermark detection failed.")
+            logger.warning(f"❌ Watermark detection failed (confidence: {confidence:.4f})")
             return WatermarkResponse(
                 status="failed",
-                error="Watermark detection failed after embedding"
+                error=f"Watermark detection failed (confidence: {confidence:.4f})"
             )
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"❌ Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
     finally:
+        # Cleanup
         if temp_file and os.path.exists(temp_file.name):
             try:
                 os.unlink(temp_file.name)
-                print(f"🧹 Cleaned up temporary file: {temp_file.name}")
+                logger.info(f"🧹 Cleaned up temporary file")
             except:
                 pass
+        
+        # Clear GPU cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 @app.post("/detect-watermark")
 async def detect_watermark_from_url(request: WatermarkRequest):
     if not detector_model:
-        raise HTTPException(status_code=503, detail="Detector model not loaded. Please try again later.")
+        raise HTTPException(status_code=503, detail="Detector model not loaded.")
 
     try:
-        print(f"🔄 Detecting watermark in audio from URL: {request.audioUrl}")
-        data, sr = load_audio_from_url(request.audioUrl)
-        wav, sr = preprocess_audio(data, sr)
+        logger.info(f"🔄 Detecting watermark in audio from URL: {request.audioUrl[:100]}...")
+        
+        # Load and preprocess audio
+        wav, sr = load_audio_from_url(request.audioUrl)
+        wav, sr = preprocess_audio(wav, sr)
 
-        print("🔄 Detecting watermark...")
-        result, message_tensor = detector_model.detect_watermark(wav, sr)
+        # Detect watermark
+        logger.info("🔄 Detecting watermark...")
+        with torch.no_grad():
+            results, message_tensor = detector_model.detect_watermark(wav, sample_rate=sr)
 
-        if result:
-            bit_list = message_tensor.flatten().tolist()
-            binary_string = ''.join(str(int(round(bit))) for bit in bit_list[:16])
+        # Process results
+        if hasattr(results, 'mean'):
+            confidence = results.mean().item()
+            is_detected = torch.all(results > 0.5).item()
+        else:
+            confidence = float(results)
+            is_detected = results > 0.5
 
-            print(f"✅ Watermark detected! Binary: {binary_string}")
+        if is_detected:
+            detected_bits = message_tensor.squeeze().detach().cpu().numpy()
+            binary_string = ''.join(str(int(round(bit))) for bit in detected_bits[:16])
+
+            logger.info(f"✅ Watermark detected! Binary: {binary_string} (confidence: {confidence:.4f})")
+            
             return {
                 "status": "done",
                 "watermark_detected": True,
-                "confidence": float(result),
+                "confidence": float(confidence),
                 "decoded_message": binary_string
             }
         else:
-            print("❌ No watermark detected.")
+            logger.info(f"❌ No watermark detected (confidence: {confidence:.4f})")
             return {
                 "status": "done",
                 "watermark_detected": False,
-                "confidence": 0.0,
+                "confidence": float(confidence),
                 "decoded_message": None
             }
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error detecting watermark: {str(e)}")
+        logger.error(f"❌ Error detecting watermark: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 # === Run locally ===
 if __name__ == "__main__":
-    print("🚀 Starting Audio Watermarking API...")
+    logger.info("🚀 Starting Audio Watermarking API v3...")
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=8080,
-        reload=True,
+        reload=False,
         log_level="info"
     )
