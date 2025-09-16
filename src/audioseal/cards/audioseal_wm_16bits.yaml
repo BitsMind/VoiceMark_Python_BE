@@ -1,13 +1,6 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 name: audioseal_wm_16bits
 model_type: seanet
-# checkpoint: "https://huggingface.co/facebook/audioseal/resolve/main/generator_base.pth"
-checkpoint: "C:/Users/nguye/audioseal/src/audioseal/cards/checkpoint_generator_95.pth"
+checkpoint: "https://huggingface.co/taono9001/BitsMind/resolve/main/checkpoint_generator_final.pth"
 nbits: 16
 seanet:
   activation: ELU
